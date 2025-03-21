@@ -22,8 +22,8 @@ app.post('/session', async (req, res) => {
         'OpenAI-Beta': 'realtime=v1'
       },
       body: JSON.stringify({
-        model: 'gpt-4o-realtime-preview-2024-12-17',
-        voice: 'alloy' // You can change this to any available voice: alloy, echo, fable, onyx, nova, shimmer
+        model: 'gpt-4o-mini-realtime-preview',
+        voice: 'ash' // You can change this to any available voice: alloy, echo, fable, onyx, nova, shimmer
       }),
     });
     
