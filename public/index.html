@@ -1,0 +1,454 @@
+<!-- public/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenAI Realtime API Test</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .container {
+      display: flex;
+      flex-direction: column;
+      height: 80vh;
+    }
+    .conversation {
+      flex: 1;
+      overflow-y: auto;
+      border: 1px solid #ccc;
+      padding: 15px;
+      margin-bottom: 15px;
+      border-radius: 5px;
+    }
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    button {
+      padding: 10px 15px;
+      cursor: pointer;
+      border-radius: 5px;
+      border: none;
+      background-color: #007bff;
+      color: white;
+      font-weight: bold;
+    }
+    button:disabled {
+      background-color: #cccccc;
+    }
+    .user-message {
+      background-color: #e6f7ff;
+      padding: 10px;
+      border-radius: 5px;
+      margin-bottom: 10px;
+    }
+    .assistant-message {
+      background-color: #f0f0f0;
+      padding: 10px;
+      border-radius: 5px;
+      margin-bottom: 10px;
+    }
+    .status {
+      font-style: italic;
+      color: #666;
+      margin-bottom: 10px;
+    }
+    .error {
+      color: #ff0000;
+      font-weight: bold;
+      padding: 10px;
+      background-color: #ffeeee;
+      border-radius: 5px;
+      margin-bottom: 10px;
+    }
+    .debug {
+      font-family: monospace;
+      font-size: 12px;
+      background-color: #f8f8f8;
+      padding: 10px;
+      margin: 10px 0;
+      border-radius: 5px;
+      border-left: 3px solid #007bff;
+      white-space: pre-wrap;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+  </style>
+</head>
+<body>
+  <h1>OpenAI Realtime API Voice Chat</h1>
+  <div class="container">
+    <div class="conversation" id="conversation">
+      <div class="status" id="status">Initializing...</div>
+    </div>
+    <div class="controls">
+      <button id="startButton" disabled>Start Talking</button>
+      <button id="stopButton" disabled>Stop Talking</button>
+      <button id="resetButton">Reset Conversation</button>
+    </div>
+  </div>
+
+  <script>
+    const conversation = document.getElementById('conversation');
+    const statusElement = document.getElementById('status');
+    const startButton = document.getElementById('startButton');
+    const stopButton = document.getElementById('stopButton');
+    const resetButton = document.getElementById('resetButton');
+    
+    let peerConnection;
+    let dataChannel;
+    let mediaStream;
+    let isConnected = false;
+    let isListening = false;
+    
+    // Track messages to prevent duplicates
+    let processedMessageIds = new Set();
+    let lastTranscriptText = '';
+    let sessionInitialized = false;
+
+    // For debugging (optional)
+    function addDebugInfo(label, data) {
+      const debugDiv = document.createElement('div');
+      debugDiv.classList.add('debug');
+      debugDiv.textContent = `${label}: ${JSON.stringify(data, null, 2)}`;
+      conversation.appendChild(debugDiv);
+      conversation.scrollTop = conversation.scrollHeight;
+    }
+
+    async function initialize() {
+      updateStatus('Connecting to server...');
+      processedMessageIds.clear();
+      sessionInitialized = false;
+      
+      try {
+        // Get ephemeral token from server
+        const response = await fetch('/session', {
+          method: 'POST'
+        });
+        
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.error || 'Failed to get session token');
+        }
+        
+        const sessionData = await response.json();
+        if (!sessionData.client_secret || !sessionData.client_secret.value) {
+          throw new Error('Invalid session response: missing client_secret');
+        }
+        
+        const ephemeralToken = sessionData.client_secret.value;
+        console.log('Got ephemeral token');
+        
+        // Set up WebRTC connection
+        peerConnection = new RTCPeerConnection({
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+        
+        // Create data channel for events
+        dataChannel = peerConnection.createDataChannel('oai-events');
+        setupDataChannel();
+        
+        // Add handlers for remote audio stream
+        peerConnection.ontrack = (event) => {
+          console.log('Received remote track');
+          const audioElement = new Audio();
+          audioElement.srcObject = event.streams[0];
+          audioElement.autoplay = true;
+          document.body.appendChild(audioElement);
+        };
+        
+        // Get user audio
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStream.getTracks().forEach(track => {
+          peerConnection.addTrack(track, mediaStream);
+        });
+        
+        // Create and set local description (offer)
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        
+        // Send offer to OpenAI Realtime API
+        const model = 'gpt-4o-realtime-preview-2024-12-17';
+        const sdpResponse = await fetch(`https://api.openai.com/v1/realtime?model=${model}`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${ephemeralToken}`,
+            'Content-Type': 'application/sdp',
+            'OpenAI-Beta': 'realtime=v1'
+          },
+          body: peerConnection.localDescription.sdp
+        });
+        
+        if (!sdpResponse.ok) {
+          const errorText = await sdpResponse.text();
+          throw new Error(`Failed to connect to OpenAI API: ${sdpResponse.status} ${errorText}`);
+        }
+        
+        // Get and set remote description (answer)
+        const sdpAnswer = await sdpResponse.text();
+        await peerConnection.setRemoteDescription({
+          type: 'answer',
+          sdp: sdpAnswer
+        });
+        
+        isConnected = true;
+        updateStatus('Connected! Click "Start Talking" to begin.');
+        startButton.disabled = false;
+        
+      } catch (error) {
+        console.error('Initialization error:', error);
+        updateStatus(`Failed to initialize: ${error.message}`);
+      }
+    }
+    
+    function setupDataChannel() {
+      dataChannel.onopen = () => {
+        console.log('Data channel opened');
+        sessionInitialized = true;
+        
+        // Send initial message only once when channel opens
+        setTimeout(() => {
+          if (dataChannel && dataChannel.readyState === 'open') {
+            const itemId = `item_${Date.now()}`;
+            
+            sendEvent({
+              type: 'conversation.item.create',
+              item: {
+                id: itemId,
+                type: 'message',
+                role: 'user',
+                content: [
+                  {
+                    type: 'input_text',
+                    text: 'Hello, can you introduce yourself briefly?'
+                  }
+                ]
+              }
+            });
+            
+            // Let the automatic turn detection handle the response
+            // Don't explicitly call response.create
+          }
+        }, 1000);
+      };
+      
+      dataChannel.onclose = () => {
+        console.log('Data channel closed');
+        updateStatus('Connection closed. Please reset to reconnect.');
+      };
+      
+      dataChannel.onerror = (error) => {
+        console.error('Data channel error:', error);
+      };
+      
+      dataChannel.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          handleEvent(data);
+        } catch (error) {
+          console.error('Error parsing message:', error);
+        }
+      };
+    }
+    
+    function handleEvent(event) {
+      // Optional debugging
+      // console.log('Received event:', event);
+      
+      if (event.type === 'error') {
+        updateStatus(`Error: ${event.error?.message || 'Unknown error'}`);
+        return;
+      }
+      
+      // Handle session creation events
+      if (event.type === 'session.created' || event.type === 'session.updated') {
+        // Session events are normal, just log them
+        console.log(`Session event: ${event.type}`);
+        return;
+      }
+      
+      // Handle rate limit updates
+      if (event.type === 'rate_limits.updated') {
+        // Just log rate limit updates
+        console.log('Rate limits updated');
+        return;
+      }
+      
+      // Handle speech events
+      if (event.type === 'speech_started') {
+        updateStatus('Assistant is speaking...');
+        return;
+      }
+      
+      if (event.type === 'speech_ended') {
+        updateStatus('Assistant finished speaking');
+        return;
+      }
+      
+      // Handle final transcripts
+      if (event.type === 'final_transcript' && event.text) {
+        // Avoid duplicate transcripts
+        if (event.text !== lastTranscriptText) {
+          lastTranscriptText = event.text;
+          addMessageToConversation('user', event.text);
+          // No need to manually send the transcript or create a response
+          // The server will automatically do this via VAD
+        }
+        return;
+      }
+      
+      // Handle audio transcript done events
+      if (event.type === 'response.audio_transcript.done' && event.transcript) {
+        // Only update UI for complete transcripts, not deltas
+        addMessageToConversation('assistant', event.transcript);
+        return;
+      }
+      
+      // Handle assistant messages - only process once by tracking IDs
+      if (event.type === 'conversation.item.created' && 
+          event.item?.role === 'assistant' && 
+          event.item?.id && 
+          !processedMessageIds.has(event.item.id)) {
+        
+        processedMessageIds.add(event.item.id);
+        
+        // Extract text from content if it exists and has been completed
+        if (event.item.content && 
+            Array.isArray(event.item.content) && 
+            event.item.status === 'completed') {
+          
+          let text = '';
+          for (const content of event.item.content) {
+            if ((content.type === 'input_text' || content.type === 'text' || content.type === 'audio') 
+                && content.transcript) {
+              text += content.transcript;
+            }
+          }
+          
+          if (text) {
+            addMessageToConversation('assistant', text);
+          }
+        }
+        
+        return;
+      }
+    }
+    
+    function sendEvent(event) {
+      if (dataChannel && dataChannel.readyState === 'open') {
+        console.log('Sending event:', event);
+        dataChannel.send(JSON.stringify(event));
+      } else {
+        console.error('Data channel not ready');
+      }
+    }
+    
+    function startListening() {
+      if (!isConnected) return;
+      
+      isListening = true;
+      startButton.disabled = true;
+      stopButton.disabled = false;
+      updateStatus('Listening...');
+      
+      // Start recording audio
+      sendEvent({
+        type: 'input_audio_buffer.append',
+        audio_type: 'microphone'
+      });
+    }
+    
+    function stopListening() {
+      if (!isListening) return;
+      
+      isListening = false;
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      updateStatus('Processing...');
+      
+      // Stop recording and commit the audio
+      // The server will automatically create a response due to the turn_detection.create_response=true setting
+      sendEvent({
+        type: 'input_audio_buffer.commit'
+      });
+      
+      // DO NOT manually create a response - this was causing the duplication
+    }
+    
+    function resetConversation() {
+      if (isListening) {
+        stopListening();
+      }
+      
+      // Clear conversation (except status)
+      while (conversation.firstChild) {
+        if (conversation.firstChild === statusElement) {
+          conversation.firstChild.nextSibling && conversation.removeChild(conversation.firstChild.nextSibling);
+        } else {
+          conversation.removeChild(conversation.firstChild);
+        }
+      }
+      
+      // Close existing connections
+      if (peerConnection) {
+        peerConnection.close();
+      }
+      
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+      }
+      
+      isConnected = false;
+      isListening = false;
+      startButton.disabled = true;
+      stopButton.disabled = true;
+      
+      // Reset tracking variables
+      processedMessageIds.clear();
+      lastTranscriptText = '';
+      sessionInitialized = false;
+      
+      // Reconnect
+      initialize();
+    }
+    
+    function addMessageToConversation(role, content) {
+      if (!content) return;
+      
+      // Check for duplicate messages by looking at nearby messages
+      const messages = conversation.querySelectorAll(role === 'user' ? '.user-message' : '.assistant-message');
+      if (messages.length > 0) {
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage.textContent === content) {
+          // Skip duplicates
+          return;
+        }
+      }
+      
+      const messageDiv = document.createElement('div');
+      messageDiv.classList.add(role === 'user' ? 'user-message' : 'assistant-message');
+      messageDiv.textContent = content;
+      conversation.appendChild(messageDiv);
+      conversation.scrollTop = conversation.scrollHeight;
+    }
+    
+    function updateStatus(message) {
+      statusElement.textContent = message;
+    }
+    
+    // Event listeners
+    startButton.addEventListener('click', startListening);
+    stopButton.addEventListener('click', stopListening);
+    resetButton.addEventListener('click', resetConversation);
+    
+    // Initialize on page load
+    initialize();
+  </script>
+</body>
+</html>
