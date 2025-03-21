@@ -111,9 +111,13 @@
     let processedMessageIds = new Set();
     let lastTranscriptText = '';
     let sessionInitialized = false;
+    let audioElement = null;
+    let enableDebug = false; // Set to true to see detailed event logs
 
-    // For debugging (optional)
+    // For debugging
     function addDebugInfo(label, data) {
+      if (!enableDebug) return;
+      
       const debugDiv = document.createElement('div');
       debugDiv.classList.add('debug');
       debugDiv.textContent = `${label}: ${JSON.stringify(data, null, 2)}`;
@@ -156,11 +160,27 @@
         
         // Add handlers for remote audio stream
         peerConnection.ontrack = (event) => {
-          console.log('Received remote track');
-          const audioElement = new Audio();
+          console.log('Received remote track', event);
+          
+          // Create new audio element if it doesn't exist
+          if (!audioElement) {
+            audioElement = new Audio();
+            document.body.appendChild(audioElement);
+          }
+          
           audioElement.srcObject = event.streams[0];
           audioElement.autoplay = true;
-          document.body.appendChild(audioElement);
+          
+          // Force play (needed for some browsers)
+          audioElement.play().catch(e => {
+            console.error('Failed to play audio:', e);
+            updateStatus('Audio playback failed. Click anywhere on the page to enable audio.');
+            
+            // Add a click handler to start playback after user interaction
+            document.body.addEventListener('click', () => {
+              audioElement.play().catch(err => console.error('Still failed to play:', err));
+            }, { once: true });
+          });
         };
         
         // Get user audio
@@ -232,8 +252,12 @@
               }
             });
             
-            // Let the automatic turn detection handle the response
-            // Don't explicitly call response.create
+            // Explicitly request a response (helps ensure initial message gets responded to)
+            setTimeout(() => {
+              sendEvent({
+                type: 'response.create'
+              });
+            }, 500);
           }
         }, 1000);
       };
@@ -258,8 +282,8 @@
     }
     
     function handleEvent(event) {
-      // Optional debugging
-      // console.log('Received event:', event);
+      // Log all events for debugging
+      addDebugInfo('Received event', event);
       
       if (event.type === 'error') {
         updateStatus(`Error: ${event.error?.message || 'Unknown error'}`);
@@ -268,14 +292,12 @@
       
       // Handle session creation events
       if (event.type === 'session.created' || event.type === 'session.updated') {
-        // Session events are normal, just log them
         console.log(`Session event: ${event.type}`);
         return;
       }
       
       // Handle rate limit updates
       if (event.type === 'rate_limits.updated') {
-        // Just log rate limit updates
         console.log('Rate limits updated');
         return;
       }
@@ -297,52 +319,67 @@
         if (event.text !== lastTranscriptText) {
           lastTranscriptText = event.text;
           addMessageToConversation('user', event.text);
-          // No need to manually send the transcript or create a response
-          // The server will automatically do this via VAD
+          
+          // Explicitly create conversation item with the transcript text
+          const itemId = `item_${Date.now()}`;
+          sendEvent({
+            type: 'conversation.item.create',
+            item: {
+              id: itemId,
+              type: 'message',
+              role: 'user',
+              content: [
+                {
+                  type: 'input_text',
+                  text: event.text
+                }
+              ]
+            }
+          });
+          
+          // Explicitly request a response (more reliable than VAD)
+          setTimeout(() => {
+            sendEvent({
+              type: 'response.create'
+            });
+          }, 300);
         }
         return;
       }
       
       // Handle audio transcript done events
       if (event.type === 'response.audio_transcript.done' && event.transcript) {
-        // Only update UI for complete transcripts, not deltas
         addMessageToConversation('assistant', event.transcript);
         return;
       }
       
       // Handle assistant messages - only process once by tracking IDs
-      if (event.type === 'conversation.item.created' && 
-          event.item?.role === 'assistant' && 
-          event.item?.id && 
-          !processedMessageIds.has(event.item.id)) {
-        
-        processedMessageIds.add(event.item.id);
-        
-        // Extract text from content if it exists and has been completed
-        if (event.item.content && 
-            Array.isArray(event.item.content) && 
-            event.item.status === 'completed') {
+      if (event.type === 'conversation.item.created' || event.type === 'conversation.item.create') {
+        if (event.item?.role === 'assistant' && event.item?.id && !processedMessageIds.has(event.item.id)) {
+          processedMessageIds.add(event.item.id);
           
-          let text = '';
-          for (const content of event.item.content) {
-            if ((content.type === 'input_text' || content.type === 'text' || content.type === 'audio') 
-                && content.transcript) {
-              text += content.transcript;
+          // Extract text from content if it exists
+          if (event.item.content && Array.isArray(event.item.content)) {
+            let text = '';
+            for (const content of event.item.content) {
+              if ((content.type === 'input_text' || content.type === 'text' || content.type === 'audio') 
+                  && (content.text || content.transcript)) {
+                text += content.text || content.transcript || '';
+              }
+            }
+            
+            if (text) {
+              addMessageToConversation('assistant', text);
             }
           }
-          
-          if (text) {
-            addMessageToConversation('assistant', text);
-          }
         }
-        
         return;
       }
     }
     
     function sendEvent(event) {
       if (dataChannel && dataChannel.readyState === 'open') {
-        console.log('Sending event:', event);
+        addDebugInfo('Sending event', event);
         dataChannel.send(JSON.stringify(event));
       } else {
         console.error('Data channel not ready');
@@ -373,12 +410,9 @@
       updateStatus('Processing...');
       
       // Stop recording and commit the audio
-      // The server will automatically create a response due to the turn_detection.create_response=true setting
       sendEvent({
         type: 'input_audio_buffer.commit'
       });
-      
-      // DO NOT manually create a response - this was causing the duplication
     }
     
     function resetConversation() {
@@ -402,6 +436,13 @@
       
       if (mediaStream) {
         mediaStream.getTracks().forEach(track => track.stop());
+      }
+      
+      // Remove the audio element if it exists
+      if (audioElement) {
+        audioElement.pause();
+        audioElement.remove();
+        audioElement = null;
       }
       
       isConnected = false;
